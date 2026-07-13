@@ -1,0 +1,400 @@
+"""
+Leenalchi Cafe — Telegram-бот системи лояльності (бабл-ті + бали)
+
+Клієнт: /start -> ділиться номером телефону (кнопка, підтверджує сам Telegram,
+        SMS не потрібні) -> бачить баланс і історію нарахувань.
+Адмін:  окремі команди, доступні тільки user_id з списку ADMIN_IDS ->
+        пошук клієнта за номером, нарахування/списання балів.
+
+Запуск:
+    pip install -r requirements.txt
+    export BOT_TOKEN="твій_токен_від_BotFather"
+    export ADMIN_IDS="123456789,987654321"
+    python bot.py
+"""
+
+import asyncio
+import logging
+import os
+import re
+import sqlite3
+from contextlib import closing
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Contact,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("leenalchi_bot")
+
+# ---------------------------------------------------------------------------
+# Конфігурація
+# ---------------------------------------------------------------------------
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
+DB_PATH = os.environ.get("DB_PATH", "leenalchi.db")
+REWARD_STEP = 100  # балів на один безкоштовний напій
+
+# ---------------------------------------------------------------------------
+# База даних (SQLite, простий і надійний варіант для старту)
+# ---------------------------------------------------------------------------
+
+def db_init() -> None:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                phone       TEXT UNIQUE,
+                name        TEXT,
+                balance     INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                amount      INTEGER,
+                note        TEXT,
+                by_admin    INTEGER,
+                created_at  TEXT
+            )
+            """
+        )
+        con.commit()
+
+
+def normalize_phone(raw: str) -> str:
+    digits = re.sub(r"[^\d+]", "", raw or "")
+    if digits and not digits.startswith("+"):
+        digits = "+" + digits
+    return digits
+
+
+def get_user_by_phone(phone: str):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_id(telegram_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_user(telegram_id: int, phone: str, name: str):
+    """Створює клієнта або прив'язує справжній telegram_id до запису,
+    який адмін міг раніше створити вручну через /register (з негативним fake_id)."""
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        existing_by_phone = con.execute(
+            "SELECT * FROM users WHERE phone = ?", (phone,)
+        ).fetchone()
+        if existing_by_phone and existing_by_phone["telegram_id"] != telegram_id:
+            # переносимо бали/історію на справжній telegram_id клієнта
+            old_id = existing_by_phone["telegram_id"]
+            con.execute(
+                "UPDATE users SET telegram_id = ?, name = ? WHERE telegram_id = ?",
+                (telegram_id, name, old_id),
+            )
+            con.execute(
+                "UPDATE transactions SET telegram_id = ? WHERE telegram_id = ?",
+                (telegram_id, old_id),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO users (telegram_id, phone, name, balance, created_at)
+                VALUES (?, ?, ?, 0, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET phone=excluded.phone, name=excluded.name
+                """,
+                (telegram_id, phone, name, datetime.utcnow().isoformat()),
+            )
+        con.commit()
+
+
+def apply_points(phone: str, amount: int, note: str, by_admin: bool) -> dict | None:
+    user = get_user_by_phone(phone)
+    if not user:
+        return None
+    new_balance = max(0, user["balance"] + amount)
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute(
+            "UPDATE users SET balance = ? WHERE telegram_id = ?",
+            (new_balance, user["telegram_id"]),
+        )
+        con.execute(
+            """
+            INSERT INTO transactions (telegram_id, amount, note, by_admin, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user["telegram_id"], amount, note, int(by_admin), datetime.utcnow().isoformat()),
+        )
+        con.commit()
+    user["balance"] = new_balance
+    return user
+
+
+def get_history(telegram_id: int, limit: int = 10):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM transactions WHERE telegram_id = ? ORDER BY id DESC LIMIT ?",
+            (telegram_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Допоміжне
+# ---------------------------------------------------------------------------
+
+def cup_bar(balance: int) -> str:
+    progress = balance % REWARD_STEP
+    filled = round((progress / REWARD_STEP) * 10)
+    bar = "🧋" * filled + "▫️" * (10 - filled)
+    left = REWARD_STEP - progress
+    return f"{bar}\nЩе {left} балів до безкоштовного напою"
+
+
+def is_admin(telegram_id: int) -> bool:
+    return telegram_id in ADMIN_IDS
+
+
+# ---------------------------------------------------------------------------
+# Роутери
+# ---------------------------------------------------------------------------
+
+client_router = Router()
+admin_router = Router()
+
+
+class AdminStates(StatesGroup):
+    waiting_phone = State()
+    waiting_amount = State()
+
+
+CONTACT_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📱 Поділитися номером", request_contact=True)]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
+@client_router.message(Command("start"))
+async def cmd_start(message: Message):
+    user = get_user_by_id(message.from_user.id)
+    if user:
+        await message.answer(
+            f"З поверненням, {user['name']}! 🦜\n\n"
+            f"Твій баланс: <b>{user['balance']}</b> балів\n\n{cup_bar(user['balance'])}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    await message.answer(
+        "Привіт! Я бот <b>Leenalchi Cafe</b> 🦜🧋\n"
+        "Твій трохи дивний, але завжди приємний друг.\n\n"
+        "Поділись номером телефону, щоб я міг створити твій бонусний рахунок "
+        "і бариста міг нараховувати тобі бали за замовлення.",
+        reply_markup=CONTACT_KB,
+    )
+
+
+@client_router.message(F.contact)
+async def on_contact(message: Message):
+    contact: Contact = message.contact
+    if contact.user_id != message.from_user.id:
+        await message.answer("Будь ласка, поділись саме своїм номером телефону 🙂")
+        return
+    phone = normalize_phone(contact.phone_number)
+    name = message.from_user.first_name or "Друже"
+    upsert_user(message.from_user.id, phone, name)
+    await message.answer(
+        f"Готово, {name}! Акаунт створено 🎉\n"
+        f"Твій номер {phone} прив'язаний до бонусного рахунку.\n\n"
+        "Команди:\n"
+        "/balance — мій баланс\n"
+        "/history — історія нарахувань",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@client_router.message(Command("balance"))
+async def cmd_balance(message: Message):
+    user = get_user_by_id(message.from_user.id)
+    if not user:
+        await message.answer("Спершу поділись номером телефону: /start")
+        return
+    await message.answer(
+        f"Баланс: <b>{user['balance']}</b> балів\n\n{cup_bar(user['balance'])}"
+    )
+
+
+@client_router.message(Command("history"))
+async def cmd_history(message: Message):
+    user = get_user_by_id(message.from_user.id)
+    if not user:
+        await message.answer("Спершу поділись номером телефону: /start")
+        return
+    history = get_history(user["telegram_id"])
+    if not history:
+        await message.answer("Поки що порожньо. Замов щось смачне 🧋")
+        return
+    lines = []
+    for h in history:
+        sign = "+" if h["amount"] >= 0 else ""
+        date = h["created_at"][:16].replace("T", " ")
+        note = f" — {h['note']}" if h["note"] else ""
+        lines.append(f"{sign}{h['amount']} балів{note}  ({date})")
+    await message.answer("Останні операції:\n\n" + "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Адмінська частина
+# ---------------------------------------------------------------------------
+
+@admin_router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "Панель персоналу 🦜\n\n"
+        "/find +380XXXXXXXXX — знайти клієнта\n"
+        "/add +380XXXXXXXXX 50 [примітка] — нарахувати бали\n"
+        "/sub +380XXXXXXXXX 50 [примітка] — списати бали\n"
+        "/register +380XXXXXXXXX Ім'я — зареєструвати клієнта вручну"
+    )
+
+
+@admin_router.message(Command("find"))
+async def cmd_find(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    if not command.args:
+        await message.answer("Формат: /find +380XXXXXXXXX")
+        return
+    phone = normalize_phone(command.args.strip())
+    user = get_user_by_phone(phone)
+    if not user:
+        await message.answer(
+            f"Клієнта з номером {phone} не знайдено.\n"
+            f"Зареєструвати: /register {phone} Ім'я"
+        )
+        return
+    await message.answer(
+        f"👤 {user['name']}\n📱 {user['phone']}\n💰 Баланс: {user['balance']} балів"
+    )
+
+
+@admin_router.message(Command("register"))
+async def cmd_register(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+    if not command.args:
+        await message.answer("Формат: /register +380XXXXXXXXX Ім'я")
+        return
+    parts = command.args.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /register +380XXXXXXXXX Ім'я")
+        return
+    phone, name = normalize_phone(parts[0]), parts[1]
+    if get_user_by_phone(phone):
+        await message.answer("Клієнт з таким номером вже існує.")
+        return
+    # Реєструємо із службовим telegram_id (від'ємний), поки клієнт сам не запустить бота —
+    # тоді записи об'єднаються під його справжнім id при першому /start.
+    fake_id = -abs(hash(phone)) % 10_000_000
+    upsert_user(fake_id, phone, name)
+    await message.answer(f"Клієнта {name} ({phone}) зареєстровано з балансом 0.")
+
+
+async def _add_or_sub(message: Message, command: CommandObject, sign: int, label: str):
+    if not is_admin(message.from_user.id):
+        return
+    if not command.args:
+        await message.answer(f"Формат: /{label} +380XXXXXXXXX 50 [примітка]")
+        return
+    parts = command.args.strip().split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer(f"Формат: /{label} +380XXXXXXXXX 50 [примітка]")
+        return
+    phone = normalize_phone(parts[0])
+    amount = sign * int(parts[1])
+    note = parts[2] if len(parts) > 2 else ""
+    user = apply_points(phone, amount, note, by_admin=True)
+    if not user:
+        await message.answer(
+            f"Клієнта з номером {phone} не знайдено.\n"
+            f"Зареєструвати: /register {phone} Ім'я"
+        )
+        return
+    verb = "Нараховано" if sign > 0 else "Списано"
+    await message.answer(
+        f"{verb} {abs(amount)} балів для {user['name']} ({phone}).\n"
+        f"Новий баланс: {user['balance']}"
+    )
+    # Повідомляємо самого клієнта, якщо він вже реєструвався через бота (id > 0)
+    if user["telegram_id"] > 0:
+        try:
+            bot = message.bot
+            sign_str = "+" if amount >= 0 else ""
+            note_str = f" ({note})" if note else ""
+            await bot.send_message(
+                user["telegram_id"],
+                f"🧋 {sign_str}{amount} балів{note_str}\nТвій баланс: {user['balance']}",
+            )
+        except Exception as e:  # клієнт міг заблокувати бота — не критично
+            log.warning("Не вдалось повідомити клієнта %s: %s", user["telegram_id"], e)
+
+
+@admin_router.message(Command("add"))
+async def cmd_add(message: Message, command: CommandObject):
+    await _add_or_sub(message, command, sign=1, label="add")
+
+
+@admin_router.message(Command("sub"))
+async def cmd_sub(message: Message, command: CommandObject):
+    await _add_or_sub(message, command, sign=-1, label="sub")
+
+
+# ---------------------------------------------------------------------------
+# Точка входу
+# ---------------------------------------------------------------------------
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Задай змінну середовища BOT_TOKEN (токен від @BotFather)")
+    db_init()
+    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(admin_router)
+    dp.include_router(client_router)
+    log.info("Бот запущено. Адміни: %s", ADMIN_IDS or "не задані!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
