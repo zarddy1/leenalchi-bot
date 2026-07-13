@@ -22,6 +22,8 @@ from contextlib import closing
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -388,7 +390,7 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("Задай змінну середовища BOT_TOKEN (токен від @BotFather)")
     db_init()
-    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
     dp.include_router(client_router)
