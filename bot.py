@@ -29,6 +29,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     Contact,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -184,6 +187,34 @@ def cup_bar(balance: int) -> str:
 
 def is_admin(telegram_id: int) -> bool:
     return telegram_id in ADMIN_IDS
+
+
+CLIENT_COMMANDS = [
+    BotCommand(command="start", description="Почати / мій кабінет"),
+    BotCommand(command="balance", description="Мій баланс балів"),
+    BotCommand(command="history", description="Історія нарахувань"),
+]
+
+ADMIN_COMMANDS = CLIENT_COMMANDS + [
+    BotCommand(command="admin", description="Довідка для персоналу"),
+    BotCommand(command="find", description="Знайти клієнта за номером"),
+    BotCommand(command="add", description="Нарахувати бали"),
+    BotCommand(command="sub", description="Списати бали"),
+    BotCommand(command="register", description="Зареєструвати клієнта вручну"),
+]
+
+
+async def setup_commands(bot: Bot) -> None:
+    # Дефолтне меню (бачать усі, кому не задано інше) — тільки клієнтські команди
+    await bot.set_my_commands(CLIENT_COMMANDS, scope=BotCommandScopeDefault())
+    # Персональне меню для кожного адміна — клієнтські + адмінські команди
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except Exception as e:
+            log.warning("Не вдалось задати меню команд для адміна %s: %s", admin_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +425,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
     dp.include_router(client_router)
+    await setup_commands(bot)
     log.info("Бот запущено. Адміни: %s", ADMIN_IDS or "не задані!")
     await dp.start_polling(bot)
 
