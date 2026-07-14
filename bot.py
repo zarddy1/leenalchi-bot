@@ -53,6 +53,7 @@ ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 DB_PATH = os.environ.get("DB_PATH", "leenalchi.db")
+MENU_URL = "https://leenalchi.choiceqr.com/menu"
 
 # Приклад — потім заміниш на реальні назви й вартість напоїв
 REWARDS = [
@@ -208,6 +209,7 @@ def is_admin(telegram_id: int) -> bool:
 
 CLIENT_COMMANDS = [
     BotCommand(command="start", description="Почати / мій кабінет"),
+    BotCommand(command="menu", description="Меню кафе"),
     BotCommand(command="balance", description="Мій баланс балів"),
     BotCommand(command="history", description="Історія нарахувань"),
 ]
@@ -289,10 +291,16 @@ async def on_contact(message: Message):
         f"Готово, {name}! Акаунт створено 🎉\n"
         f"Твій номер {phone} прив'язаний до бонусного рахунку.\n\n"
         "Команди:\n"
+        "/menu — меню кафе\n"
         "/balance — мій баланс\n"
         "/history — історія нарахувань",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+
+@client_router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await message.answer(f"Наше меню 🧋\n{MENU_URL}")
 
 
 @client_router.message(Command("balance"))
