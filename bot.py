@@ -208,6 +208,7 @@ ADMIN_COMMANDS = CLIENT_COMMANDS + [
     BotCommand(command="admin", description="Довідка для персоналу"),
     BotCommand(command="find", description="Знайти клієнта за номером"),
     BotCommand(command="list", description="Список усіх клієнтів"),
+    BotCommand(command="broadcast", description="Розіслати новину всім клієнтам"),
     BotCommand(command="add", description="Нарахувати бали"),
     BotCommand(command="sub", description="Списати бали"),
     BotCommand(command="register", description="Зареєструвати клієнта вручну"),
@@ -238,6 +239,7 @@ admin_router = Router()
 class AdminStates(StatesGroup):
     waiting_phone = State()
     waiting_amount = State()
+    waiting_broadcast = State()
 
 
 CONTACT_KB = ReplyKeyboardMarkup(
@@ -343,6 +345,43 @@ async def cmd_list(message: Message):
         return
     lines = [f"{u['phone']} — {u['name']} ({u['balance']} балів)" for u in users]
     await message.answer("Зареєстровані клієнти:\n\n" + "\n".join(lines))
+
+
+@admin_router.message(Command("broadcast"))
+async def cmd_broadcast_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_broadcast)
+    await message.answer("Надішли фото з підписом (текст новини) — розішлю всім клієнтам. /cancel — скасувати.")
+
+
+@admin_router.message(Command("cancel"), AdminStates.waiting_broadcast)
+async def cmd_broadcast_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Скасовано.")
+
+
+@admin_router.message(AdminStates.waiting_broadcast, F.photo)
+async def cmd_broadcast_send(message: Message, state: FSMContext):
+    await state.clear()
+    photo_id = message.photo[-1].file_id
+    caption = message.caption or ""
+    users = get_all_users(limit=100000)
+    sent, failed = 0, 0
+    for u in users:
+        if u["telegram_id"] <= 0:
+            continue
+        try:
+            await message.bot.send_photo(u["telegram_id"], photo_id, caption=caption)
+            sent += 1
+        except Exception:
+            failed += 1
+    await message.answer(f"Розіслано: {sent}, не доставлено: {failed}")
+
+
+@admin_router.message(AdminStates.waiting_broadcast)
+async def cmd_broadcast_wrong(message: Message):
+    await message.answer("Потрібне фото з підписом. Спробуй ще раз або /cancel.")
 
 
 @admin_router.message(Command("find"))
