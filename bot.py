@@ -3,8 +3,9 @@ Leenalchi Cafe — Telegram-бот системи лояльності (бабл
 
 Клієнт: /start -> ділиться номером телефону (кнопка, підтверджує сам Telegram,
         SMS не потрібні) -> бачить баланс і історію нарахувань.
-Адмін:  окремі команди, доступні тільки user_id з списку ADMIN_IDS ->
-        пошук клієнта за номером, нарахування/списання балів.
+Адмін:  окремі команди/кнопки, доступні тільки user_id з списку ADMIN_IDS ->
+        пошук клієнта за номером (повним або останніми 4 цифрами),
+        нарахування/списання балів.
 
 Запуск:
     pip install -r requirements.txt
@@ -33,12 +34,9 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     Contact,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -105,6 +103,30 @@ def get_user_by_phone(phone: str):
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
         return dict(row) if row else None
+
+
+def get_users_by_suffix(suffix: str, limit: int = 10):
+    """Пошук клієнтів за останніми цифрами номера (напр. останні 4)."""
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM users WHERE phone LIKE ? ORDER BY created_at DESC LIMIT ?",
+            (f"%{suffix}", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def search_clients(query: str):
+    """Універсальний пошук: повний номер -> точний збіг,
+    короткий фрагмент (напр. останні 4 цифри) -> пошук за закінченням номера."""
+    digits = re.sub(r"\D", "", query or "")
+    if len(digits) >= 9:
+        phone = normalize_phone(query)
+        user = get_user_by_phone(phone)
+        return [user] if user else []
+    if len(digits) >= 3:
+        return get_users_by_suffix(digits)
+    return []
 
 
 def get_user_by_id(telegram_id: int):
@@ -202,6 +224,10 @@ def rewards_text(balance: int) -> str:
     return "\n".join(lines)
 
 
+def client_card(u: dict) -> str:
+    return f"👤 {u['name']}\n📱 {u['phone']}\n💰 Баланс: {u['balance']} балів"
+
+
 def is_admin(telegram_id: int) -> bool:
     return telegram_id in ADMIN_IDS
 
@@ -214,8 +240,8 @@ CLIENT_COMMANDS = [
 ]
 
 ADMIN_COMMANDS = CLIENT_COMMANDS + [
-    BotCommand(command="admin", description="Довідка для персоналу"),
-    BotCommand(command="find", description="Знайти клієнта за номером"),
+    BotCommand(command="admin", description="Панель персоналу"),
+    BotCommand(command="find", description="Знайти клієнта (номер або останні 4 цифри)"),
     BotCommand(command="list", description="Список усіх клієнтів"),
     BotCommand(command="broadcast", description="Розіслати новину всім клієнтам"),
     BotCommand(command="add", description="Нарахувати бали"),
@@ -236,18 +262,8 @@ async def setup_commands(bot: Bot) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Роутери
+# Клавіатури
 # ---------------------------------------------------------------------------
-
-client_router = Router()
-admin_router = Router()
-
-
-class AdminStates(StatesGroup):
-    waiting_phone = State()
-    waiting_amount = State()
-    waiting_broadcast = State()
-
 
 CONTACT_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="📱 Поділитися номером", request_contact=True)]],
@@ -262,6 +278,27 @@ CLIENT_KB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
+ADMIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔍 Пошук клієнта"), KeyboardButton(text="📋 Всі клієнти")],
+        [KeyboardButton(text="📢 Розсилка"), KeyboardButton(text="❓ Довідка")],
+    ],
+    resize_keyboard=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Роутери
+# ---------------------------------------------------------------------------
+
+client_router = Router()
+admin_router = Router()
+
+
+class AdminStates(StatesGroup):
+    waiting_search = State()
+    waiting_broadcast = State()
 
 
 @client_router.message(Command("start"))
@@ -360,11 +397,13 @@ async def cmd_admin(message: Message):
         return
     await message.answer(
         "Панель персоналу 🦜\n\n"
-        "/find +380XXXXXXXXX — знайти клієнта\n"
+        "/find +380XXXXXXXXX або останні 4 цифри — знайти клієнта\n"
         "/list — список усіх зареєстрованих клієнтів\n"
         "/add +380XXXXXXXXX 50 [примітка] — нарахувати бали\n"
         "/sub +380XXXXXXXXX 50 [примітка] — списати бали\n"
-        "/register +380XXXXXXXXX Ім'я — зареєструвати клієнта вручну"
+        "/register +380XXXXXXXXX Ім'я — зареєструвати клієнта вручну\n\n"
+        "Або користуйся кнопками нижче 👇",
+        reply_markup=ADMIN_KB,
     )
 
 
@@ -388,10 +427,14 @@ async def cmd_broadcast_start(message: Message, state: FSMContext):
     await message.answer("Надішли фото з підписом (текст новини) — розішлю всім клієнтам. /cancel — скасувати.")
 
 
-@admin_router.message(Command("cancel"), AdminStates.waiting_broadcast)
-async def cmd_broadcast_cancel(message: Message, state: FSMContext):
+@admin_router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if await state.get_state() is None:
+        return
     await state.clear()
-    await message.answer("Скасовано.")
+    await message.answer("Скасовано.", reply_markup=ADMIN_KB)
 
 
 @admin_router.message(AdminStates.waiting_broadcast, F.photo)
@@ -409,7 +452,7 @@ async def cmd_broadcast_send(message: Message, state: FSMContext):
             sent += 1
         except Exception:
             failed += 1
-    await message.answer(f"Розіслано: {sent}, не доставлено: {failed}")
+    await message.answer(f"Розіслано: {sent}, не доставлено: {failed}", reply_markup=ADMIN_KB)
 
 
 @admin_router.message(AdminStates.waiting_broadcast)
@@ -422,18 +465,26 @@ async def cmd_find(message: Message, command: CommandObject):
     if not is_admin(message.from_user.id):
         return
     if not command.args:
-        await message.answer("Формат: /find +380XXXXXXXXX")
+        await message.answer("Формат: /find +380XXXXXXXXX або останні 4 цифри, напр. /find 1782")
         return
-    phone = normalize_phone(command.args.strip())
-    user = get_user_by_phone(phone)
-    if not user:
-        await message.answer(
-            f"Клієнта з номером {phone} не знайдено.\n"
-            f"Зареєструвати: /register {phone} Ім'я"
-        )
+    await run_search(message, command.args.strip())
+
+
+async def run_search(message: Message, query: str):
+    results = search_clients(query)
+    if not results:
+        digits = re.sub(r"\D", "", query)
+        phone = normalize_phone(query) if len(digits) >= 9 else None
+        extra = f"\nЗареєструвати: /register {phone} Ім'я" if phone else ""
+        await message.answer(f"Клієнта за запитом «{query}» не знайдено.{extra}")
         return
+    if len(results) == 1:
+        await message.answer(client_card(results[0]))
+        return
+    lines = [f"{u['phone']} — {u['name']} ({u['balance']} балів)" for u in results]
     await message.answer(
-        f"👤 {user['name']}\n📱 {user['phone']}\n💰 Баланс: {user['balance']} балів"
+        f"Знайдено {len(results)} клієнтів за «{query}»:\n\n" + "\n".join(lines) +
+        "\n\nВведи повний номер у /find для точного результату."
     )
 
 
@@ -452,6 +503,8 @@ async def cmd_register(message: Message, command: CommandObject):
     if get_user_by_phone(phone):
         await message.answer("Клієнт з таким номером вже існує.")
         return
+    # Реєструємо із службовим telegram_id (від'ємний), поки клієнт сам не запустить бота —
+    # тоді записи об'єднаються під його справжнім id при першому /start.
     fake_id = -abs(hash(phone)) % 10_000_000
     upsert_user(fake_id, phone, name)
     await message.answer(f"Клієнта {name} ({phone}) зареєстровано з балансом 0.")
@@ -482,6 +535,7 @@ async def _add_or_sub(message: Message, command: CommandObject, sign: int, label
         f"{verb} {abs(amount)} балів для {user['name']} ({phone}).\n"
         f"Новий баланс: {user['balance']}"
     )
+    # Повідомляємо самого клієнта, якщо він вже реєструвався через бота (id > 0)
     if user["telegram_id"] > 0:
         try:
             bot = message.bot
@@ -491,7 +545,7 @@ async def _add_or_sub(message: Message, command: CommandObject, sign: int, label
                 user["telegram_id"],
                 f"🧋 {sign_str}{amount} балів{note_str}\nТвій баланс: {user['balance']}",
             )
-        except Exception as e:
+        except Exception as e:  # клієнт міг заблокувати бота — не критично
             log.warning("Не вдалось повідомити клієнта %s: %s", user["telegram_id"], e)
 
 
@@ -503,6 +557,37 @@ async def cmd_add(message: Message, command: CommandObject):
 @admin_router.message(Command("sub"))
 async def cmd_sub(message: Message, command: CommandObject):
     await _add_or_sub(message, command, sign=-1, label="sub")
+
+
+# --- кнопки адмінської клавіатури ---
+
+@admin_router.message(F.text == "📋 Всі клієнти")
+async def btn_list(message: Message):
+    await cmd_list(message)
+
+
+@admin_router.message(F.text == "📢 Розсилка")
+async def btn_broadcast(message: Message, state: FSMContext):
+    await cmd_broadcast_start(message, state)
+
+
+@admin_router.message(F.text == "❓ Довідка")
+async def btn_help(message: Message):
+    await cmd_admin(message)
+
+
+@admin_router.message(F.text == "🔍 Пошук клієнта")
+async def btn_search_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_search)
+    await message.answer("Введи номер телефону або останні 4 цифри:")
+
+
+@admin_router.message(AdminStates.waiting_search)
+async def btn_search_run(message: Message, state: FSMContext):
+    await state.clear()
+    await run_search(message, message.text.strip())
 
 
 # ---------------------------------------------------------------------------
