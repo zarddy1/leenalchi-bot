@@ -53,7 +53,12 @@ ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 DB_PATH = os.environ.get("DB_PATH", "leenalchi.db")
-REWARD_STEP = 100  # балів на один безкоштовний напій
+
+# Приклад — потім заміниш на реальні назви й вартість напоїв
+REWARDS = [
+    {"name": "Маленький бабл-ті", "cost": 80},
+    {"name": "Великий бабл-ті", "cost": 150},
+]
 
 # ---------------------------------------------------------------------------
 # База даних (SQLite, простий і надійний варіант для старту)
@@ -186,12 +191,15 @@ def get_history(telegram_id: int, limit: int = 10):
 # Допоміжне
 # ---------------------------------------------------------------------------
 
-def cup_bar(balance: int) -> str:
-    progress = balance % REWARD_STEP
-    filled = round((progress / REWARD_STEP) * 10)
-    bar = "🧋" * filled + "▫️" * (10 - filled)
-    left = REWARD_STEP - progress
-    return f"{bar}\nЩе {left} балів до безкоштовного напою"
+def rewards_text(balance: int) -> str:
+    lines = []
+    for r in REWARDS:
+        if balance >= r["cost"]:
+            lines.append(f"✅ {r['name']} ({r['cost']} балів) — вже можна забрати!")
+        else:
+            left = r["cost"] - balance
+            lines.append(f"🧋 {r['name']} ({r['cost']} балів) — не вистачає {left}")
+    return "\n".join(lines)
 
 
 def is_admin(telegram_id: int) -> bool:
@@ -255,7 +263,7 @@ async def cmd_start(message: Message):
     if user:
         await message.answer(
             f"З поверненням, {user['name']}! 🦜\n\n"
-            f"Твій баланс: <b>{user['balance']}</b> балів\n\n{cup_bar(user['balance'])}",
+            f"Твій баланс: <b>{user['balance']}</b> балів\n\n{rewards_text(user['balance'])}",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
@@ -294,7 +302,7 @@ async def cmd_balance(message: Message):
         await message.answer("Спершу поділись номером телефону: /start")
         return
     await message.answer(
-        f"Баланс: <b>{user['balance']}</b> балів\n\n{cup_bar(user['balance'])}"
+        f"Баланс: <b>{user['balance']}</b> балів\n\n{rewards_text(user['balance'])}"
     )
 
 
