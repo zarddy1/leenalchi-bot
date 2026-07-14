@@ -125,7 +125,6 @@ def upsert_user(telegram_id: int, phone: str, name: str):
             "SELECT * FROM users WHERE phone = ?", (phone,)
         ).fetchone()
         if existing_by_phone and existing_by_phone["telegram_id"] != telegram_id:
-            # переносимо бали/історію на справжній telegram_id клієнта
             old_id = existing_by_phone["telegram_id"]
             con.execute(
                 "UPDATE users SET telegram_id = ?, name = ? WHERE telegram_id = ?",
@@ -226,9 +225,7 @@ ADMIN_COMMANDS = CLIENT_COMMANDS + [
 
 
 async def setup_commands(bot: Bot) -> None:
-    # Дефолтне меню (бачать усі, кому не задано інше) — тільки клієнтські команди
     await bot.set_my_commands(CLIENT_COMMANDS, scope=BotCommandScopeDefault())
-    # Персональне меню для кожного адміна — клієнтські + адмінські команди
     for admin_id in ADMIN_IDS:
         try:
             await bot.set_my_commands(
@@ -258,6 +255,14 @@ CONTACT_KB = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+CLIENT_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🧋 Меню")],
+        [KeyboardButton(text="📜 Історія")],
+    ],
+    resize_keyboard=True,
+)
+
 
 @client_router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -266,7 +271,7 @@ async def cmd_start(message: Message):
         await message.answer(
             f"З поверненням, {user['name']}! 🦜\n\n"
             f"Твій баланс: <b>{user['balance']}</b> балів\n\n{rewards_text(user['balance'])}",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=CLIENT_KB,
         )
         return
     await message.answer(
@@ -290,11 +295,8 @@ async def on_contact(message: Message):
     await message.answer(
         f"Готово, {name}! Акаунт створено 🎉\n"
         f"Твій номер {phone} прив'язаний до бонусного рахунку.\n\n"
-        "Команди:\n"
-        "/menu — меню кафе\n"
-        "/balance — мій баланс\n"
-        "/history — історія нарахувань",
-        reply_markup=ReplyKeyboardRemove(),
+        "Обери дію на клавіатурі нижче 👇",
+        reply_markup=CLIENT_KB,
     )
 
 
@@ -331,6 +333,21 @@ async def cmd_history(message: Message):
         note = f" — {h['note']}" if h["note"] else ""
         lines.append(f"{sign}{h['amount']} балів{note}  ({date})")
     await message.answer("Останні операції:\n\n" + "\n".join(lines))
+
+
+@client_router.message(F.text == "💰 Баланс")
+async def btn_balance(message: Message):
+    await cmd_balance(message)
+
+
+@client_router.message(F.text == "🧋 Меню")
+async def btn_menu(message: Message):
+    await cmd_menu(message)
+
+
+@client_router.message(F.text == "📜 Історія")
+async def btn_history(message: Message):
+    await cmd_history(message)
 
 
 # ---------------------------------------------------------------------------
@@ -435,8 +452,6 @@ async def cmd_register(message: Message, command: CommandObject):
     if get_user_by_phone(phone):
         await message.answer("Клієнт з таким номером вже існує.")
         return
-    # Реєструємо із службовим telegram_id (від'ємний), поки клієнт сам не запустить бота —
-    # тоді записи об'єднаються під його справжнім id при першому /start.
     fake_id = -abs(hash(phone)) % 10_000_000
     upsert_user(fake_id, phone, name)
     await message.answer(f"Клієнта {name} ({phone}) зареєстровано з балансом 0.")
@@ -467,7 +482,6 @@ async def _add_or_sub(message: Message, command: CommandObject, sign: int, label
         f"{verb} {abs(amount)} балів для {user['name']} ({phone}).\n"
         f"Новий баланс: {user['balance']}"
     )
-    # Повідомляємо самого клієнта, якщо він вже реєструвався через бота (id > 0)
     if user["telegram_id"] > 0:
         try:
             bot = message.bot
@@ -477,7 +491,7 @@ async def _add_or_sub(message: Message, command: CommandObject, sign: int, label
                 user["telegram_id"],
                 f"🧋 {sign_str}{amount} балів{note_str}\nТвій баланс: {user['balance']}",
             )
-        except Exception as e:  # клієнт міг заблокувати бота — не критично
+        except Exception as e:
             log.warning("Не вдалось повідомити клієнта %s: %s", user["telegram_id"], e)
 
 
