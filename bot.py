@@ -163,6 +163,15 @@ def apply_points(phone: str, amount: int, note: str, by_admin: bool) -> dict | N
     return user
 
 
+def get_all_users(limit: int = 50):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM users ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_history(telegram_id: int, limit: int = 10):
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.row_factory = sqlite3.Row
@@ -198,6 +207,7 @@ CLIENT_COMMANDS = [
 ADMIN_COMMANDS = CLIENT_COMMANDS + [
     BotCommand(command="admin", description="Довідка для персоналу"),
     BotCommand(command="find", description="Знайти клієнта за номером"),
+    BotCommand(command="list", description="Список усіх клієнтів"),
     BotCommand(command="add", description="Нарахувати бали"),
     BotCommand(command="sub", description="Списати бали"),
     BotCommand(command="register", description="Зареєструвати клієнта вручну"),
@@ -316,10 +326,23 @@ async def cmd_admin(message: Message):
     await message.answer(
         "Панель персоналу 🦜\n\n"
         "/find +380XXXXXXXXX — знайти клієнта\n"
+        "/list — список усіх зареєстрованих клієнтів\n"
         "/add +380XXXXXXXXX 50 [примітка] — нарахувати бали\n"
         "/sub +380XXXXXXXXX 50 [примітка] — списати бали\n"
         "/register +380XXXXXXXXX Ім'я — зареєструвати клієнта вручну"
     )
+
+
+@admin_router.message(Command("list"))
+async def cmd_list(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    users = get_all_users()
+    if not users:
+        await message.answer("Клієнтів ще немає.")
+        return
+    lines = [f"{u['phone']} — {u['name']} ({u['balance']} балів)" for u in users]
+    await message.answer("Зареєстровані клієнти:\n\n" + "\n".join(lines))
 
 
 @admin_router.message(Command("find"))
